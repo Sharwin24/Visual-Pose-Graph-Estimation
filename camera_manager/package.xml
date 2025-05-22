@@ -4,7 +4,8 @@
   <name>camera_manager</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="sharwin24@gmail.com">sharwin</maintainer>
+  <maintainer email="sharwin.patil@u.northwestern.edu">Sharwin Patil</maintainer>
+  <maintainer email="sayantani.bhattacharya2025@u.northwestern.edu">Sayantani Bhattacharya</maintainer>
   <license>TODO: License declaration</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
@@ -14,6 +15,9 @@
 
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
+  <depend>opencv2</depend>
+  <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
 
   <export>
     <build_type>ament_cmake</build_type>
