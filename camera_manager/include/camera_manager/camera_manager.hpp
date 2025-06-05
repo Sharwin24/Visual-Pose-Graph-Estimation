@@ -121,7 +121,7 @@ public:
   void UpdateCameraPoseVisualization();
   void initializePoseGraph();
   void addEdge(const Edge& edge);
-  void addNode(int frameID, const cv::Mat& currentPose); 
+  void addNode(int frameID, const cv::Mat& currentPose);
   void optimizePoseGraph();
   Edge LoopClosureDetector();
   void visulizePoseGraph();

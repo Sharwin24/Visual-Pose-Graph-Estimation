@@ -3,4 +3,4 @@ camera_manager:
     timer_frequency: 100.0 # [Hz]
     use_stereo_camera: true # True -> stereo camera, False -> monocular camera
     stereo_baseline: 0.05 # Stereo baseline distance [m]
-    feature_extraction_method: "ORB" # Options: "ORB", "SIFT"
+    feature_extraction_method: "SIFT" # Options: "ORB", "SIFT"

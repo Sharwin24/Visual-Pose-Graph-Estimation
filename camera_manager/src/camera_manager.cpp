@@ -78,7 +78,7 @@ CameraManager::CameraManager() : Node("camera_manager") {
   baseLinkTransform.header.stamp = this->now();
   baseLinkTransform.header.frame_id = "world";
   baseLinkTransform.child_frame_id = "odom";
-  baseLinkTransform.transform.translation.x = 1.0;
+  baseLinkTransform.transform.translation.x = 0.0;
   baseLinkTransform.transform.translation.y = 0.0;
   baseLinkTransform.transform.translation.z = 0.0;
   tf2::Quaternion q;
@@ -315,8 +315,13 @@ StereoFeature CameraManager::StereoFeatureExtractor(const Frame& leftFrame, cons
     extractor->detectAndCompute(rightFrame.image, cv::noArray(), stereoFeature.rightKeypoints, stereoFeature.rightDescriptors);
     return stereoFeature;
   } else if (this->featureExtractionMethod == "SIFT") {
-    // Default to SIFT if no valid method is specified
-    cv::Ptr<cv::Feature2D> extractor = cv::SIFT::create();
+    cv::Ptr<cv::Feature2D> extractor = cv::SIFT::create(
+      0, // nfeatures
+      3, // nOctaveLayers
+      0.04, // contrastThreshold
+      10, // edgeThreshold
+      1.6 // sigma
+    );
     extractor->detectAndCompute(leftFrame.image, cv::noArray(), stereoFeature.leftKeypoints, stereoFeature.leftDescriptors);
     extractor->detectAndCompute(rightFrame.image, cv::noArray(), stereoFeature.rightKeypoints, stereoFeature.rightDescriptors);
     return stereoFeature;
@@ -397,35 +402,87 @@ Edge CameraManager::StereoCameraPoseEstimation(const StereoFeature& newFeature) 
   matcher.match(previousStereoFeature.leftDescriptors, newFeature.leftDescriptors, matches);
 
   // Filter good matches 
-  double min_dist = 100;
-  for (const auto& m : matches) min_dist = std::min(min_dist, (double)m.distance);
+  double min_dist = DBL_MAX;
+  for (const auto& m : matches) {
+    min_dist = std::min(min_dist, (double)m.distance);
+  }
   std::vector<cv::DMatch> good_matches;
   for (const auto& m : matches) {
-    if (m.distance <= std::max(2 * min_dist, 30.0)) good_matches.push_back(m);
-  }
-  // Triangulate 3D points in previous and current frames
-  std::vector<cv::Point3f> pts3d_prev, pts3d_curr;
-  std::vector<cv::Point2f> pts2d_curr;
-  const cv::Mat K = this->leftCameraIntrinsics.K; // 3x3 camera matrix
-  for (const auto& m : good_matches) {
-    // Get left/right keypoints for triangulation
-    cv::Point2f kpL_prev = previousStereoFeature.leftKeypoints[m.queryIdx].pt;
-    cv::Point2f kpR_prev = previousStereoFeature.rightKeypoints[m.queryIdx].pt;
-    cv::Point2f kpL_curr = newFeature.leftKeypoints[m.trainIdx].pt;
-    cv::Point2f kpR_curr = newFeature.rightKeypoints[m.trainIdx].pt;
-    // Compute disparity and check validity
-    float disp_prev = kpL_prev.x - kpR_prev.x;
-    float disp_curr = kpL_curr.x - kpR_curr.x;
-    if (disp_prev > 1.0 && disp_curr > 1.0) {
-      // Triangulate previous 3D point
-      float Z_prev = K.at<double>(0, 0) * this->stereoBaseline / disp_prev;
-      float X_prev = (kpL_prev.x - K.at<double>(0, 2)) * Z_prev / K.at<double>(0, 0);
-      float Y_prev = (kpL_prev.y - K.at<double>(1, 2)) * Z_prev / K.at<double>(1, 1);
-      pts3d_prev.emplace_back(X_prev, Y_prev, Z_prev);
-      // Triangulate current 3D point (for PnP, we only need 2D in current frame)
-      pts2d_curr.emplace_back(kpL_curr);
+    if (m.distance <= std::max(2 * min_dist, 30.0)) {
+      good_matches.push_back(m);
     }
   }
+  // If too few correspondences, bail out with identity
+  if (good_matches.size() < 5) {
+    edge.relativePose = cv::Mat::eye(4, 4, CV_64F);
+    return edge;
+  }
+
+  const cv::Mat K = this->leftCameraIntrinsics.K; // 3x3 camera matrix
+  const cv::Mat D = this->leftCameraIntrinsics.D; // Distortion coefficients
+  const double sbl = this->stereoBaseline; // Stereo baseline
+  cv::Mat I3 = cv::Mat::eye(3, 3, CV_64F); // 3x3 identity matrix
+
+  // Build projection matrices for the PREVIOUS stereo pair:
+  // Let the left camera pose be the “reference” (identity). Then the right
+  // camera is translated along +X by “baseline” in that same coord‐frame.
+  //
+  //    P_L = K * [I | 0]
+  //    P_R = K * [I | t],   where t = (-baseline, 0, 0)^T
+
+  // Left Projection: [I | 0]
+  cv::Mat P_L = cv::Mat::zeros(3, 4, CV_64F);
+  I3.copyTo(P_L(cv::Rect(0, 0, 3, 3))); // Copy identity matrix
+  P_L = K * P_L; // Apply intrinsic matrix
+  // Right Projection: [I | t] with t = (-baseline, 0, 0)^T
+  cv::Mat P_R = cv::Mat::zeros(3, 4, CV_64F);
+  I3.copyTo(P_R(cv::Rect(0, 0, 3, 3))); // Copy identity matrix
+  // translation vector t=(-baseline, 0, 0)^T
+  P_R.at<double>(0, 3) = -sbl; // Set translation in X direction
+  P_R.at<double>(1, 3) = 0;
+  P_R.at<double>(2, 3) = 0;
+  P_R = K * P_R; // Apply intrinsic matrix
+
+  // Collect 2D points from the previous stereo pair, according to good_matches
+  std::vector<cv::Point2f> ptsL_prev, ptsR_prev;
+  // Also collect corresponding 2D point in CURRENT left image for PnP:
+  std::vector<cv::Point2f> pts2d_curr;
+  ptsL_prev.reserve(good_matches.size());
+  ptsR_prev.reserve(good_matches.size());
+  pts2d_curr.reserve(good_matches.size());
+
+  for (size_t i = 0; i < good_matches.size(); ++i) {
+    const cv::DMatch& m = good_matches[i];
+    // Previous‐frame LEFT keypoint  (matched by m.queryIdx)
+    ptsL_prev.emplace_back(previousStereoFeature.leftKeypoints[m.queryIdx].pt);
+    // Previous‐frame RIGHT keypoint (assuming rightKeypoints is index‐aligned
+    // with leftKeypoints; i.e.  leftKeypoints[i] ↔ rightKeypoints[i] )
+    ptsR_prev.emplace_back(previousStereoFeature.rightKeypoints[m.queryIdx].pt);
+    // Current‐frame LEFT keypoint (for 2D side of PnP)
+    pts2d_curr.emplace_back(newFeature.leftKeypoints[m.trainIdx].pt);
+  }
+
+  // Triangulate all “previous‐frame” correspondences in one batch:
+  cv::Mat points4DH; // 4×N, each column = [X, Y, Z, W]^T in homogeneous coords
+  cv::triangulatePoints(P_L, P_R, ptsL_prev, ptsR_prev, points4DH);
+
+  // Convert homogeneous -> Euclidean and fill pts3d_prev
+  std::vector<cv::Point3f> pts3d_prev;
+  pts3d_prev.reserve(points4DH.cols);
+  for (int c = 0; c < points4DH.cols; ++c) {
+    float X = points4DH.at<float>(0, c);
+    float Y = points4DH.at<float>(1, c);
+    float Z = points4DH.at<float>(2, c);
+    float W = points4DH.at<float>(3, c);
+    if (std::abs(W) < 1e-6) { // Avoid division by zero by removing degenerate points
+      continue;
+    }
+    pts3d_prev.emplace_back(float(X / W),
+      float(Y / W),
+      float(Z / W));
+  }
+
+  // If after removing degenerate points we have too few 3D points:
   if (pts3d_prev.size() < 5) {
     edge.relativePose = cv::Mat::eye(4, 4, CV_64F);
     return edge;
@@ -433,19 +490,34 @@ Edge CameraManager::StereoCameraPoseEstimation(const StereoFeature& newFeature) 
 
   // Solve PnP: to estimate the rotation and translation between the previous and current frames using the 3D-2D correspondences.
   cv::Mat rvec, tvec, inliers;
-  cv::solvePnPRansac(
-    pts3d_prev, pts2d_curr, K,
-    cv::Mat(), rvec, tvec,
-    false, 100, 8.0, 0.99, inliers
+  const bool useExtrinsicGuess = false;
+  const int iterationsCount = 100; // Number of RANSAC iterations
+  const float reprojectionError = 8.0; // Maximum reprojection error
+  const double confidence = 0.99; // Confidence level for RANSAC
+  const int flags = cv::SOLVEPNP_EPNP;
+  bool success = cv::solvePnPRansac(
+    pts3d_prev, // 3D points in previous frame
+    pts2d_curr, // 2D points in current frame
+    K, D, // Camera intrinsic parameters
+    rvec, tvec, // Output rotation and translation vector
+    useExtrinsicGuess, iterationsCount, reprojectionError, confidence, // RANSAC parameters
+    inliers, // Output inliers mask
+    flags
   );
 
+  if (!success || inliers.rows < 4) {
+    RCLCPP_ERROR(this->get_logger(), "[StereoCameraPoseEstimation] PnP failed for frame ID %d", newFeature.frameID);
+    edge.relativePose = cv::Mat::eye(4, 4, CV_64F); // Return identity if PnP fails
+    return edge;
+  }
+
   // Convert rvec to rotation matrix
-  cv::Mat R;
-  cv::Rodrigues(rvec, R);
+  cv::Mat Rcurr;
+  cv::Rodrigues(rvec, Rcurr);
 
   // Build 4x4 transformation matrix
   edge.relativePose = cv::Mat::eye(4, 4, CV_64F);
-  R.copyTo(edge.relativePose(cv::Rect(0, 0, 3, 3)));
+  Rcurr.copyTo(edge.relativePose(cv::Rect(0, 0, 3, 3)));
   tvec.copyTo(edge.relativePose(cv::Rect(3, 0, 1, 3)));
   return edge;
 }
@@ -571,53 +643,52 @@ void CameraManager::addEdge(const Edge& edge) {
 
   optimizer->addEdge(e);
 
-  RCLCPP_INFO(
-    this->get_logger(),
-    "Added edge to pose graph: from %d to %d",
-    edge.fromID, edge.toID
-  );
+  // RCLCPP_INFO(
+  //   this->get_logger(),
+  //   "Added edge to pose graph: from %d to %d",
+  //   edge.fromID, edge.toID
+  // );
 }
 
 void CameraManager::optimizePoseGraph() {
-    // TODO: Need to call this in timer.
-    // This function optimizes the graph to refine the camera poses in least squares sense.
-    // And updates the current pose estimate based on the optimized graph.: this can be optional, config variable based.
+  // TODO: Need to call this in timer.
+  // This function optimizes the graph to refine the camera poses in least squares sense.
+  // And updates the current pose estimate based on the optimized graph.: this can be optional, config variable based.
 
-    std::lock_guard<std::mutex> lock(this->poseGraphMutex);
-    RCLCPP_INFO(this->get_logger(), "Optimizing Pose Graph");
+  std::lock_guard<std::mutex> lock(this->poseGraphMutex);
+  RCLCPP_INFO(this->get_logger(), "Optimizing Pose Graph");
 
-    int maxIterations = 20;
-    optimizer->initializeOptimization();
-    int result = optimizer->optimize(maxIterations);
+  int maxIterations = 20;
+  optimizer->initializeOptimization();
+  int result = optimizer->optimize(maxIterations);
 
-    if (result > 0) {
-        RCLCPP_INFO(this->get_logger(), "Pose graph optimization finished successfully.");
-    } else {
-        RCLCPP_WARN(this->get_logger(), "Pose graph optimization failed or did not converge.");
+  if (result > 0) {
+    RCLCPP_INFO(this->get_logger(), "Pose graph optimization finished successfully.");
+  } else {
+    RCLCPP_WARN(this->get_logger(), "Pose graph optimization failed or did not converge.");
+  }
+
+  // Optionally update currentPose from the last vertex
+  if (!optimizer->vertices().empty()) {
+    int lastId = optimizer->vertices().begin()->first;
+    auto* v = dynamic_cast<g2o::VertexSE3*>(optimizer->vertex(lastId));
+    if (v) {
+      Eigen::Isometry3d est = v->estimate();
+      Eigen::Matrix4d mat = est.matrix();
+      cv::Mat cvPose(4, 4, CV_64F);
+      for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+          cvPose.at<double>(r, c) = mat(r, c);
+      {
+        std::lock_guard<std::mutex> poseLock(this->poseMutex);
+        this->currentPose = cvPose.clone();
+      }
     }
-
-    // Optionally update currentPose from the last vertex
-    if (!optimizer->vertices().empty()) {
-        int lastId = optimizer->vertices().begin()->first;
-        auto* v = dynamic_cast<g2o::VertexSE3*>(optimizer->vertex(lastId));
-        if (v) {
-            Eigen::Isometry3d est = v->estimate();
-            Eigen::Matrix4d mat = est.matrix();
-            cv::Mat cvPose(4, 4, CV_64F);
-            for (int r = 0; r < 4; ++r)
-                for (int c = 0; c < 4; ++c)
-                    cvPose.at<double>(r, c) = mat(r, c);
-            {
-                std::lock_guard<std::mutex> poseLock(this->poseMutex);
-                this->currentPose = cvPose.clone();
-            }
-        }
-    }
-    RCLCPP_INFO(this->get_logger(), "Pose graph optimization is not yet implemented.");
+  }
+  RCLCPP_INFO(this->get_logger(), "Pose graph optimization is not yet implemented.");
 }
 
-void CameraManager::visulizePoseGraph()
-{
+void CameraManager::visulizePoseGraph() {
   // Use the Global Pose Graph [optimizer], the nodes as point markers and edge as line markers.
   // Publish all the markers in a single marker array.
   MarkerArray poseGraphMarkers;
@@ -630,7 +701,7 @@ void CameraManager::visulizePoseGraph()
 
     // Create a marker for the vertex
     visualization_msgs::msg::Marker marker;
-    marker.header.frame_id = "world";
+    marker.header.frame_id = "odom";
     marker.header.stamp = this->now();
     marker.id = id;
     marker.type = visualization_msgs::msg::Marker::SPHERE;
@@ -671,7 +742,7 @@ void CameraManager::visulizePoseGraph()
     endPoint.z = v2->estimate().translation().z();
 
     visualization_msgs::msg::Marker lineMarker;
-    lineMarker.header.frame_id = "world";
+    lineMarker.header.frame_id = "odom";
     lineMarker.header.stamp = this->now();
     lineMarker.id = v1->id() * 10000 + v2->id(); // Unique ID for the edge
     lineMarker.type = visualization_msgs::msg::Marker::LINE_STRIP;
